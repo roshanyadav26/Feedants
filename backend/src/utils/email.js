@@ -9,6 +9,10 @@ const transporter = nodemailer.createTransport({
     user: emailUser,
     pass: emailAppPassword,
   },
+  // Bound background delivery work when the SMTP provider is unresponsive.
+  connectionTimeout: 10_000,
+  greetingTimeout: 10_000,
+  socketTimeout: 15_000,
 });
 
 async function sendOtpEmail(to, otp) {

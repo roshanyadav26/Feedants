@@ -8,205 +8,195 @@ const Registration = require("../models/Registration");
 const Competition = require("../models/Competition");
 
 const router = express.Router();
-
-const uploadDirectory = path.resolve(
-  __dirname,
-  "../../uploads/entries"
-);
+const backendDirectory = path.resolve(__dirname, "../..");
+const uploadDirectory = path.join(backendDirectory, "uploads", "entries");
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 fs.mkdirSync(uploadDirectory, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDirectory);
-  },
-
+  destination: (req, file, cb) => cb(null, uploadDirectory),
   filename: (req, file, cb) => {
     const extension = path.extname(file.originalname).toLowerCase();
-
-    const uniqueName = `${Date.now()}-${Math.round(
-      Math.random() * 1e9
-    )}${extension}`;
-
+    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`;
     cb(null, uniqueName);
   },
 });
 
 const upload = multer({
   storage,
-  limits: {
-    fileSize: 100 * 1024 * 1024,
-  },
+  limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype && file.mimetype.startsWith("video/")) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only video files are allowed."));
+      return cb(null, true);
     }
+    return cb(new Error("Only video files are allowed."));
   },
 });
 
+function removeUploadedFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return;
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    console.error("Could not remove untracked video:", error);
+  }
+}
+
+function storedVideoPath(relativePath) {
+  if (typeof relativePath !== "string") return null;
+  const resolvedPath = path.resolve(backendDirectory, relativePath);
+  const relativeToUploads = path.relative(uploadDirectory, resolvedPath);
+  if (
+    !relativeToUploads ||
+    relativeToUploads.startsWith(`..${path.sep}`) ||
+    relativeToUploads === ".." ||
+    path.isAbsolute(relativeToUploads)
+  ) {
+    return null;
+  }
+  return resolvedPath;
+}
+
+function serializeEntry(entry) {
+  return {
+    id: entry._id,
+    registration: entry.registration,
+    participantName: entry.participantName,
+    email: entry.email,
+    competitionSlug: entry.competitionSlug,
+    video: {
+      fileName: entry.video.fileName,
+      originalFileName: entry.video.originalFileName,
+      mimeType: entry.video.mimeType,
+      fileSize: entry.video.fileSize,
+    },
+    submissionStatus: entry.submissionStatus,
+    paymentStatus: entry.paymentStatus,
+    submittedAt: entry.submittedAt,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+  };
+}
+
 router.post("/upload", upload.single("video"), async (req, res) => {
-  let uploadedFilePath;
-  let oldFilePath;
+  let uploadedFilePath = req.file?.path;
 
   try {
-    const { participantName, email, competitionSlug } = req.body;
+    const participantName =
+      typeof req.body?.participantName === "string"
+        ? req.body.participantName.trim()
+        : "";
+    const email =
+      typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const competitionSlug =
+      typeof req.body?.competitionSlug === "string"
+        ? req.body.competitionSlug.trim()
+        : "";
 
-    if (!participantName || !email || !competitionSlug) {
+    if (participantName.length < 2 || participantName.length > 80) {
+      removeUploadedFile(uploadedFilePath);
       return res.status(400).json({
-        message:
-          "Participant name, email, and competition are required.",
+        message: "Participant name must be between 2 and 80 characters.",
       });
+    }
+
+    if (!emailPattern.test(email) || email.length > 254) {
+      removeUploadedFile(uploadedFilePath);
+      return res.status(400).json({ message: "Please enter a valid email address." });
+    }
+
+    if (
+      !competitionSlug ||
+      competitionSlug.length > 100 ||
+      !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(competitionSlug)
+    ) {
+      removeUploadedFile(uploadedFilePath);
+      return res.status(400).json({ message: "Please provide a valid competition." });
     }
 
     if (!req.file) {
-      return res.status(400).json({
-        message: "Please attach a video file.",
-      });
+      return res.status(400).json({ message: "Please attach a video file." });
     }
 
-    uploadedFilePath = req.file.path;
-
-    const normalizedEmail = email.trim().toLowerCase();
-    const normalizedSlug = competitionSlug.trim();
-
-    const competition = await Competition.findOne({
-      slug: normalizedSlug,
-    });
-
+    const competition = await Competition.findOne({ slug: competitionSlug });
     if (!competition) {
-      return res.status(404).json({
-        message: "Competition not found.",
-      });
+      removeUploadedFile(uploadedFilePath);
+      uploadedFilePath = null;
+      return res.status(404).json({ message: "Competition not found." });
     }
 
     const registration = await Registration.findOne({
       competition: competition._id,
-      email: normalizedEmail,
-      registrationStatus: "confirmed",
+      email,
+      registrationStatus: { $in: ["confirmed", "pending_payment"] },
     });
 
     if (!registration) {
+      removeUploadedFile(uploadedFilePath);
+      uploadedFilePath = null;
       return res.status(403).json({
-        message:
-          "A confirmed registration is required before uploading a video.",
+        message: "No active registration was found for this email and competition.",
       });
     }
 
     const videoDetails = {
       fileName: req.file.filename,
       originalFileName: req.file.originalname,
-      filePath: path.relative(
-        path.resolve(__dirname, "../.."),
-        req.file.path
-      ),
+      filePath: path.relative(backendDirectory, req.file.path),
       mimeType: req.file.mimetype,
       fileSize: req.file.size,
     };
+    const submittedAt = new Date();
 
-    // If an entry already exists for this registration,
-    // replace its video instead of creating another entry.
-    const existingEntry = await Entry.findOne({
-      registration: registration._id,
-    });
-
+    // One entry is allowed per registration. A later upload replaces its video.
+    const existingEntry = await Entry.findOne({ registration: registration._id });
     if (existingEntry) {
-      oldFilePath = path.resolve(
-        path.resolve(__dirname, "../.."),
-        existingEntry.video.filePath
-      );
+      const oldFilePath = storedVideoPath(existingEntry.video?.filePath);
 
       existingEntry.participantName = registration.participantName;
       existingEntry.email = registration.email;
-      existingEntry.competitionSlug = normalizedSlug;
+      existingEntry.competitionSlug = competition.slug;
       existingEntry.video = videoDetails;
       existingEntry.submissionStatus = "submitted";
-      existingEntry.paymentStatus = registration.paymentStatus;
-
+      existingEntry.submittedAt = submittedAt;
+      // Keep the payment snapshot unchanged; uploading never updates payment.
       await existingEntry.save();
 
-      // Delete the old video only after the database update succeeds.
-      if (
-        oldFilePath &&
-        oldFilePath !== uploadedFilePath &&
-        fs.existsSync(oldFilePath)
-      ) {
-        try {
-          fs.unlinkSync(oldFilePath);
-        } catch (cleanupError) {
-          console.error(
-            "Could not remove replaced video:",
-            cleanupError
-          );
-        }
+      if (oldFilePath && oldFilePath !== uploadedFilePath) {
+        removeUploadedFile(oldFilePath);
       }
-
       uploadedFilePath = null;
 
       return res.status(200).json({
-        message: "Your video has been replaced successfully.",
-        entry: {
-          id: existingEntry._id,
-          registration: existingEntry.registration,
-          participantName: existingEntry.participantName,
-          email: existingEntry.email,
-          competitionSlug: existingEntry.competitionSlug,
-          video: existingEntry.video,
-          submissionStatus: existingEntry.submissionStatus,
-          paymentStatus: existingEntry.paymentStatus,
-          createdAt: existingEntry.createdAt,
-          updatedAt: existingEntry.updatedAt,
-        },
+        message: "Your video has been replaced and your entry status is submitted.",
+        entry: serializeEntry(existingEntry),
       });
     }
 
-    // No entry exists yet, so create the first submission.
     const entry = await Entry.create({
       registration: registration._id,
       participantName: registration.participantName,
       email: registration.email,
-      competitionSlug: normalizedSlug,
+      competitionSlug: competition.slug,
       video: videoDetails,
       submissionStatus: "submitted",
       paymentStatus: registration.paymentStatus,
+      submittedAt,
     });
-
     uploadedFilePath = null;
 
     return res.status(201).json({
       message: "Video uploaded and entry saved successfully.",
-      entry: {
-        id: entry._id,
-        registration: entry.registration,
-        participantName: entry.participantName,
-        email: entry.email,
-        competitionSlug: entry.competitionSlug,
-        video: entry.video,
-        submissionStatus: entry.submissionStatus,
-        paymentStatus: entry.paymentStatus,
-        createdAt: entry.createdAt,
-      },
+      entry: serializeEntry(entry),
     });
   } catch (error) {
     console.error("Entry upload error:", error);
-
-    // Remove the newly uploaded file if the database operation failed.
-    if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-      try {
-        fs.unlinkSync(uploadedFilePath);
-      } catch (cleanupError) {
-        console.error(
-          "Could not remove untracked video:",
-          cleanupError
-        );
-      }
-    }
+    removeUploadedFile(uploadedFilePath);
 
     if (error.code === 11000 && error.keyPattern?.registration) {
       return res.status(409).json({
-        message:
-          "An entry already exists for this registration. Please try replacing the video again.",
+        message: "An entry upload is already being processed. Please refresh status and try again.",
       });
     }
 
@@ -216,27 +206,19 @@ router.post("/upload", upload.single("video"), async (req, res) => {
   }
 });
 
-// Handle Multer and upload errors.
 router.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({
-        message: "Video must be 100 MB or smaller.",
-      });
+      return res.status(400).json({ message: "Video must be 100 MB or smaller." });
     }
-
-    return res.status(400).json({
-      message: error.message,
-    });
+    return res.status(400).json({ message: error.message });
   }
 
   if (error) {
-    return res.status(400).json({
-      message: error.message || "Upload failed.",
-    });
+    return res.status(400).json({ message: error.message || "Upload failed." });
   }
 
-  next();
+  return next();
 });
 
 module.exports = router;

@@ -506,14 +506,14 @@ router.get("/:slug/status", async (req, res) => {
     const entry = await withDbTiming("status.entry_lookup", () =>
       Entry.findOne({
         registration: registration._id,
-      }).select("submissionStatus createdAt updatedAt")
+      }).select("submissionStatus submittedAt createdAt updatedAt")
     );
 
     return res.json({
       registrationStatus: registration.registrationStatus,
       paymentStatus: registration.paymentStatus,
       submissionStatus: entry ? entry.submissionStatus : null,
-      submittedAt: entry ? entry.createdAt : null,
+      submittedAt: entry ? entry.submittedAt || entry.createdAt : null,
       lastUpdatedAt: entry ? entry.updatedAt : null,
     });
   } catch (error) {

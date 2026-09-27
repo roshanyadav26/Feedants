@@ -107,6 +107,7 @@ export default function App() {
   const [entryEmail, setEntryEmail] = useState("");
   const [pickingVideo, setPickingVideo] = useState(false);
   const [uploadingVideo, setUploadingVideo] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<"submitted" | "failed" | null>(null);
 
   const [statusEmail, setStatusEmail] = useState("");
   const [statusOtp, setStatusOtp] = useState("");
@@ -115,6 +116,7 @@ export default function App() {
   const [otpCooldown, setOtpCooldown] = useState(0);
   const [participantStatus, setParticipantStatus] =
     useState<ParticipantStatus | null>(null);
+  const [statusAccessToken, setStatusAccessToken] = useState<string | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
   const [statusProgress, setStatusProgress] = useState("");
   const [statusError, setStatusError] = useState("");
@@ -218,6 +220,7 @@ const data = JSON.parse(text);
     setStatusMessage("");
     setOtpCooldown(0);
     setParticipantStatus(null);
+    setStatusAccessToken(null);
     setStatusError("");
   }
 
@@ -323,6 +326,7 @@ const data = JSON.parse(text);
       }
 
       setParticipantStatus(data);
+      setStatusAccessToken(accessToken);
       setStatusOtp("");
       setStatusOtpSent(false);
     } catch (err) {
@@ -330,6 +334,39 @@ const data = JSON.parse(text);
         err instanceof Error
           ? err.message
           : "Could not verify the code. Please try again."
+      );
+    } finally {
+      setLoadingStatus(false);
+      setStatusProgress("");
+    }
+  }
+
+  async function handleRefreshParticipantStatus() {
+    if (!statusAccessToken) {
+      setStatusError("Verify your email again to refresh your status.");
+      return;
+    }
+
+    setLoadingStatus(true);
+    setStatusProgress("Refreshing your status…");
+    setStatusError("");
+
+    try {
+      const { response, responseText } = await fetchWithTimeout(
+        `${API_BASE_URL}/competitions/dance-championship-2026/status`,
+        { headers: { Authorization: `Bearer ${statusAccessToken}` } },
+        STATUS_REQUEST_TIMEOUT_MS,
+        "participant_status_request"
+      );
+      const data = readApiResponse(response, responseText);
+      if (!response.ok) {
+        if (response.status === 401) setStatusAccessToken(null);
+        throw new Error(data.message || "Could not refresh your status.");
+      }
+      setParticipantStatus(data);
+    } catch (err) {
+      setStatusError(
+        err instanceof Error ? err.message : "Could not refresh your status."
       );
     } finally {
       setLoadingStatus(false);
@@ -379,7 +416,7 @@ const data = JSON.parse(text);
     }
   }
 
- async function handleUploadVideo() {
+  async function handleUploadVideo() {
   if (!entryName.trim() || !entryEmail.trim()) {
     Alert.alert(
       "Missing details",
@@ -394,6 +431,7 @@ const data = JSON.parse(text);
   }
 
   setUploadingVideo(true);
+  setUploadStatus(null);
 
   try {
     const formData = new FormData();
@@ -434,6 +472,24 @@ const data = JSON.parse(text);
       );
     }
 
+    if (!data.entry || data.entry.submissionStatus !== "submitted") {
+      throw new Error("The server did not confirm that your entry was saved.");
+    }
+
+    setUploadStatus("submitted");
+    if (statusEmail.trim().toLowerCase() === entryEmail.trim().toLowerCase()) {
+      setParticipantStatus((current) =>
+        current
+          ? {
+              ...current,
+              submissionStatus: data.entry.submissionStatus,
+              submittedAt: data.entry.submittedAt || null,
+              lastUpdatedAt: data.entry.updatedAt || data.entry.submittedAt || null,
+            }
+          : current
+      );
+    }
+
     Alert.alert(
       "Video uploaded",
       "Your video was saved on the backend. Payment status is unchanged."
@@ -443,6 +499,7 @@ const data = JSON.parse(text);
     setEntryName("");
     setEntryEmail("");
   } catch (err) {
+    setUploadStatus("failed");
     Alert.alert(
       "Upload failed",
       err instanceof Error ? err.message : "Please try again."
@@ -473,6 +530,13 @@ const data = JSON.parse(text);
       </SafeAreaView>
     );
   }
+
+  const verifiedEntryStatus =
+    participantStatus &&
+    statusEmail.trim().toLowerCase() === entryEmail.trim().toLowerCase()
+      ? participantStatus.submissionStatus || "not_submitted"
+      : null;
+  const visibleEntryStatus = uploadStatus || verifiedEntryStatus;
 
   const registrationClosed =
     competition.registrationStatus !== "open" || competition.isFull;
@@ -682,6 +746,16 @@ const data = JSON.parse(text);
             Enter your details and upload your dance performance video.
           </Text>
 
+          {visibleEntryStatus && (
+            <Text style={styles.statusInfo}>
+              Entry status: {visibleEntryStatus === "failed"
+                ? "Upload failed"
+                : visibleEntryStatus === "not_submitted"
+                ? "Not submitted"
+                : visibleEntryStatus.replace(/_/g, " ")}
+            </Text>
+          )}
+
           <TextInput
             style={styles.input}
             placeholder="Participant name"
@@ -695,7 +769,10 @@ const data = JSON.parse(text);
             style={styles.input}
             placeholder="Participant email"
             value={entryEmail}
-            onChangeText={setEntryEmail}
+            onChangeText={(value) => {
+              setEntryEmail(value);
+              setUploadStatus(null);
+            }}
             keyboardType="email-address"
             autoCapitalize="none"
             autoCorrect={false}
@@ -888,12 +965,23 @@ const data = JSON.parse(text);
           )}
 
           {participantStatus && (
-            <Pressable
-              style={styles.resendStatusButton}
-              onPress={() => handleStatusEmailChange("")}
-            >
-              <Text style={styles.resendStatusText}>Check another email</Text>
-            </Pressable>
+            <>
+              <Pressable
+                style={styles.resendStatusButton}
+                onPress={handleRefreshParticipantStatus}
+                disabled={loadingStatus}
+              >
+                <Text style={styles.resendStatusText}>
+                  {loadingStatus ? "Refreshing status..." : "Refresh status"}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={styles.resendStatusButton}
+                onPress={() => handleStatusEmailChange("")}
+              >
+                <Text style={styles.resendStatusText}>Check another email</Text>
+              </Pressable>
+            </>
           )}
 
           {statusError ? (
