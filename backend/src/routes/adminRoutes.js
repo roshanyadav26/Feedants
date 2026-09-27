@@ -145,6 +145,42 @@ router.post("/login", loginRateLimit, async (req, res) => {
 
 router.use(requireAdmin);
 
+router.patch('/registrations/:id/payment', async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const registration = await Registration.findById(id)
+
+    if (!registration) {
+      return res.status(404).json({
+        message: 'Registration not found',
+      })
+    }
+
+    if (registration.registrationStatus === 'cancelled') {
+      return res.status(400).json({
+        message: 'Cancelled registrations cannot be confirmed',
+      })
+    }
+
+    registration.paymentStatus = 'paid'
+    registration.registrationStatus = 'confirmed'
+
+    await registration.save()
+
+    return res.json({
+      message: 'Payment verified and registration confirmed',
+      registration,
+    })
+  } catch (error) {
+    console.error('Payment verification error:', error)
+
+    return res.status(500).json({
+      message: 'Could not verify payment',
+    })
+  }
+})
+
 router.get("/registrations", async (req, res) => {
   const pagination = parsePagination(req.query);
   if (pagination.error) {
