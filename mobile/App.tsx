@@ -13,7 +13,24 @@ import {
 import { fetch as expoFetch } from "expo/fetch";
 import { File } from "expo-file-system";
 import { API_BASE_URL } from "./config";
+async function readApiResponse(response: Response): Promise<any> {
+  const responseText = await response.text();
 
+  if (!responseText.trim()) {
+    throw new Error(
+      `Server returned an empty response. HTTP ${response.status}`
+    );
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      `Server returned non-JSON data. HTTP ${response.status}\n` +
+        `Response: ${responseText.slice(0, 500)}`
+    );
+  }
+}
 type Competition = {
   title: string;
   category: string;
@@ -30,6 +47,14 @@ type Competition = {
 };
 
 type CompetitionTab = "About" | "Judging" | "Rules" | "Eligibility";
+
+type ParticipantStatus = {
+  registrationStatus: string;
+  paymentStatus: string;
+  submissionStatus: string | null;
+  submittedAt: string | null;
+  lastUpdatedAt: string | null;
+};
 
 export default function App() {
   const [competition, setCompetition] = useState<Competition | null>(null);
@@ -48,6 +73,12 @@ export default function App() {
   const [pickingVideo, setPickingVideo] = useState(false);
   const [uploadingVideo, setUploadingVideo] = useState(false);
 
+  const [statusEmail, setStatusEmail] = useState("");
+  const [participantStatus, setParticipantStatus] =
+    useState<ParticipantStatus | null>(null);
+  const [loadingStatus, setLoadingStatus] = useState(false);
+  const [statusError, setStatusError] = useState("");
+
   async function loadCompetition() {
     try {
       setError("");
@@ -56,8 +87,11 @@ export default function App() {
         `${API_BASE_URL}/competitions/dance-championship-2026`
       );
 
-      const data = await response.json();
+const text = await response.text();
+console.log("Status:", response.status);
+console.log("Response:", text);
 
+const data = JSON.parse(text);
       if (!response.ok) {
         throw new Error(data.message || "Could not load competition.");
       }
@@ -99,8 +133,11 @@ export default function App() {
         }
       );
 
-      const data = await response.json();
+const text = await response.text();
+console.log("Status:", response.status);
+console.log("Response:", text);
 
+const data = JSON.parse(text);
       if (!response.ok) {
         throw new Error(data.message || "Registration failed.");
       }
@@ -120,6 +157,43 @@ export default function App() {
       );
     } finally {
       setRegistering(false);
+    }
+  }
+
+  async function handleCheckStatus() {
+    const normalizedEmail = statusEmail.trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      Alert.alert("Email required", "Enter the email used for registration.");
+      return;
+    }
+
+    setLoadingStatus(true);
+    setStatusError("");
+    setParticipantStatus(null);
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/competitions/dance-championship-2026/status?email=${encodeURIComponent(
+          normalizedEmail
+        )}`
+      );
+const text = await response.text();
+console.log("Status:", response.status);
+console.log("Response:", text);
+
+const data = JSON.parse(text);
+      if (!response.ok) {
+        throw new Error(data.message || "Could not retrieve your status.");
+      }
+
+      setParticipantStatus(data);
+    } catch (err) {
+      setStatusError(
+        err instanceof Error ? err.message : "Please try again."
+      );
+    } finally {
+      setLoadingStatus(false);
     }
   }
 
@@ -583,6 +657,92 @@ export default function App() {
           </Pressable>
         </View>
 
+        {/* Participant status */}
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>My Status</Text>
+          <Text style={styles.description}>
+            Check your registration, payment, and video review status using
+            the email you registered with.
+          </Text>
+
+          <TextInput
+            style={styles.input}
+            placeholder="Registration email"
+            value={statusEmail}
+            onChangeText={setStatusEmail}
+            keyboardType="email-address"
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!loadingStatus}
+          />
+
+          <Pressable
+            style={[
+              styles.registerButton,
+              loadingStatus && styles.disabledButton,
+            ]}
+            onPress={handleCheckStatus}
+            disabled={loadingStatus}
+          >
+            <Text style={styles.buttonText}>
+              {loadingStatus ? "Checking..." : "Check My Status"}
+            </Text>
+          </Pressable>
+
+          {statusError ? (
+            <Text style={styles.errorText}>{statusError}</Text>
+          ) : null}
+
+          {participantStatus && (
+            <View style={styles.statusDetails}>
+              <View style={styles.infoRow}>
+                <Text style={styles.label}>Registration</Text>
+                <Text style={styles.value}>
+                  {participantStatus.registrationStatus.replace(/_/g, " ")}
+                </Text>
+              </View>
+
+              <View style={styles.infoRow}>
+                <Text style={styles.label}>Payment</Text>
+                <Text style={styles.value}>
+                  {participantStatus.paymentStatus}
+                </Text>
+              </View>
+
+              <View style={styles.infoRow}>
+                <Text style={styles.label}>Video review</Text>
+                <Text style={styles.value}>
+                  {participantStatus.submissionStatus
+                    ? participantStatus.submissionStatus.replace(/_/g, " ")
+                    : "Not submitted"}
+                </Text>
+              </View>
+
+              {participantStatus.submittedAt ? (
+                <View style={styles.infoRow}>
+                  <Text style={styles.label}>Submitted</Text>
+                  <Text style={styles.value}>
+                    {new Date(
+                      participantStatus.submittedAt
+                    ).toLocaleString()}
+                  </Text>
+                </View>
+              ) : null}
+
+              {participantStatus.lastUpdatedAt ? (
+                <View style={styles.infoRow}>
+                  <Text style={styles.label}>Last updated</Text>
+                  <Text style={styles.value}>
+                    {new Date(
+                      participantStatus.lastUpdatedAt
+                    ).toLocaleString()}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          )}
+        </View>
+
         <Text style={styles.note}>
           Competition details are loaded from your Feedants backend.
         </Text>
@@ -614,6 +774,18 @@ const styles = StyleSheet.create({
   error: {
     color: "#B42318",
     textAlign: "center",
+  },
+  errorText: {
+    color: "#B42318",
+    fontSize: 13,
+    marginTop: 12,
+    lineHeight: 19,
+  },
+  statusDetails: {
+    marginTop: 20,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: "#EEEEEE",
   },
   category: {
     color: "#6558D3",

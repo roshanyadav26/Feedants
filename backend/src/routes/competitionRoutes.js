@@ -1,9 +1,12 @@
 const express = require("express");
 const router = express.Router();
+
 const Competition = require("../models/Competition");
 const mongoose = require("mongoose");
 const Registration = require("../models/Registration");
+const Entry = require("../models/Entry");
 
+// Get published competition details
 router.get("/:slug", async (req, res) => {
   try {
     const competition = await Competition.findOne({
@@ -33,7 +36,7 @@ router.get("/:slug", async (req, res) => {
         ? "live"
         : "completed";
 
-    res.json({
+    return res.json({
       ...competition.toObject(),
       registrationStatus,
       competitionStatus,
@@ -45,9 +48,13 @@ router.get("/:slug", async (req, res) => {
     });
   } catch (error) {
     console.error("Get competition error:", error);
-    res.status(500).json({ message: "Server error" });
+    return res.status(500).json({
+      message: "Server error",
+    });
   }
 });
+
+// Register for a competition
 router.post("/:slug/register", async (req, res) => {
   const participantName = String(req.body.participantName || "").trim();
   const email = String(req.body.email || "").trim().toLowerCase();
@@ -102,8 +109,7 @@ router.post("/:slug/register", async (req, res) => {
         throw error;
       }
 
-      // Atomically reserve one slot. The condition prevents overbooking
-      // if multiple people register at the same time.
+      // Atomically reserve one slot to prevent overbooking.
       updatedCompetition = await Competition.findOneAndUpdate(
         {
           _id: competition._id,
@@ -111,10 +117,17 @@ router.post("/:slug/register", async (req, res) => {
           registrationOpensAt: { $lte: now },
           registrationClosesAt: { $gte: now },
           startsAt: { $gt: now },
-          $expr: { $lt: ["$registeredCount", "$maxParticipants"] },
+          $expr: {
+            $lt: ["$registeredCount", "$maxParticipants"],
+          },
         },
-        { $inc: { registeredCount: 1 } },
-        { new: true, session }
+        {
+          $inc: { registeredCount: 1 },
+        },
+        {
+          new: true,
+          session,
+        }
       );
 
       if (!updatedCompetition) {
@@ -169,4 +182,63 @@ router.post("/:slug/register", async (req, res) => {
     await session.endSession();
   }
 });
+
+// Participant status lookup by competition and email
+// Add email verification before using this publicly.
+router.get("/:slug/status", async (req, res) => {
+  try {
+    const email = String(req.query.email || "")
+      .trim()
+      .toLowerCase();
+
+    const emailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+    if (!emailIsValid || email.length > 254) {
+      return res.status(400).json({
+        message: "Please provide a valid email address.",
+      });
+    }
+
+    const competition = await Competition.findOne({
+      slug: req.params.slug,
+      status: "published",
+    }).select("_id slug");
+
+    if (!competition) {
+      return res.status(404).json({
+        message: "Competition not found.",
+      });
+    }
+
+    const registration = await Registration.findOne({
+      competition: competition._id,
+      email,
+    }).select("_id paymentStatus registrationStatus");
+
+    if (!registration) {
+      return res.status(404).json({
+        message: "No registration found for this email.",
+      });
+    }
+
+    const entry = await Entry.findOne({
+      registration: registration._id,
+    }).select("submissionStatus createdAt updatedAt");
+
+    return res.json({
+      registrationStatus: registration.registrationStatus,
+      paymentStatus: registration.paymentStatus,
+      submissionStatus: entry ? entry.submissionStatus : null,
+      submittedAt: entry ? entry.createdAt : null,
+      lastUpdatedAt: entry ? entry.updatedAt : null,
+    });
+  } catch (error) {
+    console.error("Participant status lookup error:", error);
+
+    return res.status(500).json({
+      message: "Could not retrieve participant status.",
+    });
+  }
+});
+
 module.exports = router;

@@ -1,1 +1,2 @@
-export const API_BASE_URL = "http://192.168.177.188:5000/api";
+export const API_BASE_URL =
+  "https://feedants-backend-9j9n.onrender.com/api";
