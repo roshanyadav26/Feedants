@@ -13,9 +13,45 @@ import {
 import { fetch as expoFetch } from "expo/fetch";
 import { File } from "expo-file-system";
 import { API_BASE_URL } from "./config";
-async function readApiResponse(response: Response): Promise<any> {
-  const responseText = await response.text();
 
+const OTP_REQUEST_TIMEOUT_MS = 90_000;
+const STATUS_REQUEST_TIMEOUT_MS = 30_000;
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number,
+  stage: "send_otp_request" | "verify_otp_request" | "participant_status_request"
+): Promise<{ response: Response; responseText: string }> {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    // Keep the abort timer active while the response body is being received.
+    const responseText = await response.text();
+    console.info(
+      `[otp-timing] stage=${stage} elapsed_ms=${Date.now() - startedAt} outcome=success`
+    );
+    return { response, responseText };
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === "AbortError";
+    console.info(
+      `[otp-timing] stage=${stage} elapsed_ms=${Date.now() - startedAt} outcome=${timedOut ? "timeout" : "error"}`
+    );
+    if (timedOut) {
+      throw new Error(
+        "The server took too long to respond. It may be waking up after being idle; please try again."
+      );
+    }
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function readApiResponse(response: Response, responseText: string): any {
   if (!responseText.trim()) {
     throw new Error(
       `Server returned an empty response. HTTP ${response.status}`
@@ -26,8 +62,7 @@ async function readApiResponse(response: Response): Promise<any> {
     return JSON.parse(responseText);
   } catch {
     throw new Error(
-      `Server returned non-JSON data. HTTP ${response.status}\n` +
-        `Response: ${responseText.slice(0, 500)}`
+      `The server returned an unexpected response (HTTP ${response.status}). It may still be starting; please try again.`
     );
   }
 }
@@ -81,6 +116,7 @@ export default function App() {
   const [participantStatus, setParticipantStatus] =
     useState<ParticipantStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
+  const [statusProgress, setStatusProgress] = useState("");
   const [statusError, setStatusError] = useState("");
 
   async function loadCompetition() {
@@ -196,20 +232,23 @@ const data = JSON.parse(text);
     if (otpCooldown > 0) return;
 
     setLoadingStatus(true);
+    setStatusProgress("Connecting to the server. The first request after idle can take longer.");
     setStatusError("");
     setParticipantStatus(null);
     setStatusMessage("");
 
     try {
-      const response = await fetch(
+      const { response, responseText } = await fetchWithTimeout(
         `${API_BASE_URL}/competitions/dance-championship-2026/status/send-otp`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: normalizedEmail }),
-        }
+        },
+        OTP_REQUEST_TIMEOUT_MS,
+        "send_otp_request"
       );
-      const data = await readApiResponse(response);
+      const data = readApiResponse(response, responseText);
       if (!response.ok) {
         throw new Error(data.message || "Could not send a verification code.");
       }
@@ -229,6 +268,7 @@ const data = JSON.parse(text);
       );
     } finally {
       setLoadingStatus(false);
+      setStatusProgress("");
     }
   }
 
@@ -241,19 +281,22 @@ const data = JSON.parse(text);
     }
 
     setLoadingStatus(true);
+    setStatusProgress("Verifying your code and loading your registration status…");
     setStatusError("");
     setStatusMessage("");
 
     try {
-      const verifyResponse = await fetch(
+      const { response: verifyResponse, responseText: verifyResponseText } = await fetchWithTimeout(
         `${API_BASE_URL}/competitions/dance-championship-2026/status/verify-otp`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: normalizedEmail, otp }),
-        }
+        },
+        STATUS_REQUEST_TIMEOUT_MS,
+        "verify_otp_request"
       );
-      const verification = await readApiResponse(verifyResponse);
+      const verification = readApiResponse(verifyResponse, verifyResponseText);
       if (!verifyResponse.ok) {
         throw new Error(
           verification.message || "The code is invalid or expired."
@@ -268,11 +311,13 @@ const data = JSON.parse(text);
         throw new Error("The server returned an invalid verification response.");
       }
 
-      const statusResponse = await fetch(
+      const { response: statusResponse, responseText: statusResponseText } = await fetchWithTimeout(
         `${API_BASE_URL}/competitions/dance-championship-2026/status`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+        STATUS_REQUEST_TIMEOUT_MS,
+        "participant_status_request"
       );
-      const data = await readApiResponse(statusResponse);
+      const data = readApiResponse(statusResponse, statusResponseText);
       if (!statusResponse.ok) {
         throw new Error(data.message || "Could not retrieve your status.");
       }
@@ -288,6 +333,7 @@ const data = JSON.parse(text);
       );
     } finally {
       setLoadingStatus(false);
+      setStatusProgress("");
     }
   }
 
@@ -769,6 +815,10 @@ const data = JSON.parse(text);
             autoCorrect={false}
             editable={!loadingStatus && !participantStatus}
           />
+
+          {loadingStatus && (
+            <Text style={styles.statusInfo}>{statusProgress}</Text>
+          )}
 
           {!statusOtpSent && !participantStatus && (
             <Pressable

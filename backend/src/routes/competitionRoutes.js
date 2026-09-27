@@ -18,6 +18,17 @@ const STATUS_TOKEN_AUDIENCE = "feedants-status-api";
 const STATUS_TOKEN_TTL_SECONDS = 10 * 60;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+async function withDbTiming(stage, operation) {
+  const startedAt = Date.now();
+  try {
+    return await operation();
+  } finally {
+    console.info(
+      `[otp-db-timing] stage=${stage} duration_ms=${Date.now() - startedAt}`
+    );
+  }
+}
+
 function getStatusTokenSecret() {
   const secret = process.env.PARTICIPANT_STATUS_TOKEN_SECRET;
   return secret && secret.length >= 32 ? secret : null;
@@ -277,10 +288,12 @@ router.post("/:slug/status/send-otp", async (req, res) => {
   }
 
   try {
-    const competition = await Competition.findOne({
-      slug: req.params.slug,
-      status: "published",
-    }).select("_id slug");
+    const competition = await withDbTiming("send.competition_lookup", () =>
+      Competition.findOne({
+        slug: req.params.slug,
+        status: "published",
+      }).select("_id slug")
+    );
 
     if (!competition) {
       return res.status(404).json({
@@ -288,10 +301,12 @@ router.post("/:slug/status/send-otp", async (req, res) => {
       });
     }
 
-    const registration = await Registration.exists({
-      competition: competition._id,
-      email,
-    });
+    const registration = await withDbTiming("send.registration_lookup", () =>
+      Registration.exists({
+        competition: competition._id,
+        email,
+      })
+    );
     if (!registration) return sendOtpAcknowledgement(res);
 
     const now = new Date();
@@ -300,22 +315,24 @@ router.post("/:slug/status/send-otp", async (req, res) => {
     let otpRecord;
 
     try {
-      otpRecord = await EmailOtp.findOneAndUpdate(
-        {
-          competition: competition._id,
-          email,
-          lastSentAt: { $lte: new Date(now.getTime() - OTP_RESEND_COOLDOWN_MS) },
-        },
-        {
-          $set: {
-            otpHash,
-            expiresAt: new Date(now.getTime() + OTP_TTL_MS),
-            attempts: 0,
-            lastSentAt: now,
+      otpRecord = await withDbTiming("send.otp_upsert", () =>
+        EmailOtp.findOneAndUpdate(
+          {
+            competition: competition._id,
+            email,
+            lastSentAt: { $lte: new Date(now.getTime() - OTP_RESEND_COOLDOWN_MS) },
           },
-          $setOnInsert: { competition: competition._id, email },
-        },
-        { new: true, upsert: true, runValidators: true }
+          {
+            $set: {
+              otpHash,
+              expiresAt: new Date(now.getTime() + OTP_TTL_MS),
+              attempts: 0,
+              lastSentAt: now,
+            },
+            $setOnInsert: { competition: competition._id, email },
+          },
+          { new: true, upsert: true, runValidators: true }
+        )
       );
     } catch (error) {
       // A concurrent send may win the unique (competition, email) index.
@@ -323,25 +340,29 @@ router.post("/:slug/status/send-otp", async (req, res) => {
       throw error;
     }
 
-    try {
-      await sendOtpEmail(email, otp);
-    } catch {
-      // Keep the cooldown record, but make this undelivered code unusable.
-      try {
-        await EmailOtp.updateOne(
-          { _id: otpRecord._id, otpHash },
-          {
-            $set: {
-              otpHash: otpDigest(secret, competition._id, email, "delivery-failed"),
-              attempts: OTP_MAX_ATTEMPTS,
-            },
-          }
-        );
-      } catch {
-        // The failed delivery remains unusable after the attempts are consumed.
-      }
-      console.error("Participant status OTP email delivery failed.");
-    }
+    // Respond as soon as the OTP is safely stored. SMTP delivery can be slow
+    // or unavailable, so it must not hold the mobile request open.
+    setImmediate(() => {
+      void sendOtpEmail(email, otp).catch(async () => {
+        // Keep the cooldown record, but make an undelivered code unusable.
+        try {
+          await withDbTiming("send.invalidate_undelivered_otp", () =>
+            EmailOtp.updateOne(
+              { _id: otpRecord._id, otpHash },
+              {
+                $set: {
+                  otpHash: otpDigest(secret, competition._id, email, "delivery-failed"),
+                  attempts: OTP_MAX_ATTEMPTS,
+                },
+              },
+            )
+          );
+        } catch {
+          // The failed delivery remains unusable after attempts are consumed.
+        }
+        console.error("Participant status OTP email delivery failed.");
+      });
+    });
 
     return sendOtpAcknowledgement(res);
   } catch (error) {
@@ -369,35 +390,31 @@ router.post("/:slug/status/verify-otp", async (req, res) => {
   }
 
   try {
-    const competition = await Competition.findOne({
-      slug: req.params.slug,
-      status: "published",
-    }).select("_id slug");
+    const competition = await withDbTiming("verify.competition_lookup", () =>
+      Competition.findOne({
+        slug: req.params.slug,
+        status: "published",
+      }).select("_id slug")
+    );
 
     if (!competition) {
       return res.status(404).json({ message: "Competition not found." });
     }
 
     const now = new Date();
-    const savedOtp = await EmailOtp.findOne({
-      competition: competition._id,
-      email,
-      expiresAt: { $gt: now },
-      attempts: { $lt: OTP_MAX_ATTEMPTS },
-    });
-    if (!savedOtp) {
-      return res.status(400).json({ message: "Invalid or expired verification code." });
-    }
-
-    // Increment atomically before checking the code, including for wrong codes.
-    const attemptedOtp = await EmailOtp.findOneAndUpdate(
-      {
-        _id: savedOtp._id,
-        expiresAt: { $gt: now },
-        attempts: { $lt: OTP_MAX_ATTEMPTS },
-      },
-      { $inc: { attempts: 1 } },
-      { new: true }
+    // Increment attempts in the lookup itself. This removes one database
+    // round-trip while preserving expiry and the atomic five-attempt ceiling.
+    const attemptedOtp = await withDbTiming("verify.increment_attempt", () =>
+      EmailOtp.findOneAndUpdate(
+        {
+          competition: competition._id,
+          email,
+          expiresAt: { $gt: now },
+          attempts: { $lt: OTP_MAX_ATTEMPTS },
+        },
+        { $inc: { attempts: 1 } },
+        { new: true }
+      )
     );
     if (!attemptedOtp) {
       return res.status(400).json({ message: "Invalid or expired verification code." });
@@ -409,20 +426,22 @@ router.post("/:slug/status/verify-otp", async (req, res) => {
     }
 
     // Consume the code atomically while retaining lastSentAt for the cooldown.
-    const consumed = await EmailOtp.findOneAndUpdate(
-      {
-        _id: attemptedOtp._id,
-        attempts: attemptedOtp.attempts,
-        otpHash: attemptedOtp.otpHash,
-        expiresAt: { $gt: new Date() },
-      },
-      {
-        $set: {
-          otpHash: otpDigest(secret, competition._id, email, "consumed"),
-          attempts: OTP_MAX_ATTEMPTS,
+    const consumed = await withDbTiming("verify.consume_otp", () =>
+      EmailOtp.findOneAndUpdate(
+        {
+          _id: attemptedOtp._id,
+          attempts: attemptedOtp.attempts,
+          otpHash: attemptedOtp.otpHash,
+          expiresAt: { $gt: new Date() },
         },
-      },
-      { new: true }
+        {
+          $set: {
+            otpHash: otpDigest(secret, competition._id, email, "consumed"),
+            attempts: OTP_MAX_ATTEMPTS,
+          },
+        },
+        { new: true }
+      )
     );
     if (!consumed) {
       return res.status(400).json({ message: "Invalid or expired verification code." });
@@ -462,27 +481,33 @@ router.get("/:slug/status", async (req, res) => {
   }
 
   try {
-    const competition = await Competition.findOne({
-      slug: req.params.slug,
-      status: "published",
-    }).select("_id slug");
+    const competition = await withDbTiming("status.competition_lookup", () =>
+      Competition.findOne({
+        slug: req.params.slug,
+        status: "published",
+      }).select("_id slug")
+    );
 
     if (!competition) {
       return res.status(404).json({ message: "Competition not found." });
     }
 
-    const registration = await Registration.findOne({
-      competition: competition._id,
-      email: authorization.email,
-    }).select("_id paymentStatus registrationStatus");
+    const registration = await withDbTiming("status.registration_lookup", () =>
+      Registration.findOne({
+        competition: competition._id,
+        email: authorization.email,
+      }).select("_id paymentStatus registrationStatus")
+    );
 
     if (!registration) {
       return res.status(404).json({ message: "Participant status unavailable." });
     }
 
-    const entry = await Entry.findOne({
-      registration: registration._id,
-    }).select("submissionStatus createdAt updatedAt");
+    const entry = await withDbTiming("status.entry_lookup", () =>
+      Entry.findOne({
+        registration: registration._id,
+      }).select("submissionStatus createdAt updatedAt")
+    );
 
     return res.json({
       registrationStatus: registration.registrationStatus,
