@@ -24,3 +24,6 @@ npm-debug.log*
 Microsoft/Windows/PowerShell/ModuleAnalysisCache
 
 **/.expo/
+# Expo build logs
+mobile/eas-build-log.txt
+mobile/eas-build-log-readable.txt
