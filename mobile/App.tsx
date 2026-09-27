@@ -74,6 +74,10 @@ export default function App() {
   const [uploadingVideo, setUploadingVideo] = useState(false);
 
   const [statusEmail, setStatusEmail] = useState("");
+  const [statusOtp, setStatusOtp] = useState("");
+  const [statusOtpSent, setStatusOtpSent] = useState(false);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [otpCooldown, setOtpCooldown] = useState(0);
   const [participantStatus, setParticipantStatus] =
     useState<ParticipantStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
@@ -107,8 +111,19 @@ const data = JSON.parse(text);
   }
 
   useEffect(() => {
-    loadCompetition();
+    const initialLoad = setTimeout(() => {
+      void loadCompetition();
+    }, 0);
+    return () => clearTimeout(initialLoad);
   }, []);
+
+  useEffect(() => {
+    if (otpCooldown <= 0) return;
+    const timeout = setTimeout(() => {
+      setOtpCooldown((remaining) => Math.max(remaining - 1, 0));
+    }, 1000);
+    return () => clearTimeout(timeout);
+  }, [otpCooldown]);
 
   async function handleRegister() {
     if (!participantName.trim() || !email.trim()) {
@@ -160,37 +175,116 @@ const data = JSON.parse(text);
     }
   }
 
-  async function handleCheckStatus() {
-    const normalizedEmail = statusEmail.trim().toLowerCase();
+  function handleStatusEmailChange(value: string) {
+    setStatusEmail(value);
+    setStatusOtp("");
+    setStatusOtpSent(false);
+    setStatusMessage("");
+    setOtpCooldown(0);
+    setParticipantStatus(null);
+    setStatusError("");
+  }
 
-    if (!normalizedEmail) {
-      Alert.alert("Email required", "Enter the email used for registration.");
+  async function handleSendStatusOtp() {
+    const normalizedEmail = statusEmail.trim().toLowerCase();
+    const emailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+
+    if (!emailIsValid || normalizedEmail.length > 254) {
+      setStatusError("Enter a valid email address.");
+      return;
+    }
+    if (otpCooldown > 0) return;
+
+    setLoadingStatus(true);
+    setStatusError("");
+    setParticipantStatus(null);
+    setStatusMessage("");
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/competitions/dance-championship-2026/status/send-otp`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: normalizedEmail }),
+        }
+      );
+      const data = await readApiResponse(response);
+      if (!response.ok) {
+        throw new Error(data.message || "Could not send a verification code.");
+      }
+
+      setStatusOtpSent(true);
+      setStatusOtp("");
+      setStatusMessage(
+        data.message ||
+          "If the email is registered, a verification code will be sent."
+      );
+      setOtpCooldown(Math.max(60, Number(data.resendAfterSeconds) || 60));
+    } catch (err) {
+      setStatusError(
+        err instanceof Error
+          ? err.message
+          : "Could not send a verification code. Please try again."
+      );
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function handleVerifyStatusOtp() {
+    const normalizedEmail = statusEmail.trim().toLowerCase();
+    const otp = statusOtp.trim();
+    if (!/^\d{6}$/.test(otp)) {
+      setStatusError("Enter the six-digit verification code.");
       return;
     }
 
     setLoadingStatus(true);
     setStatusError("");
-    setParticipantStatus(null);
+    setStatusMessage("");
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/competitions/dance-championship-2026/status?email=${encodeURIComponent(
-          normalizedEmail
-        )}`
+      const verifyResponse = await fetch(
+        `${API_BASE_URL}/competitions/dance-championship-2026/status/verify-otp`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: normalizedEmail, otp }),
+        }
       );
-const text = await response.text();
-console.log("Status:", response.status);
-console.log("Response:", text);
+      const verification = await readApiResponse(verifyResponse);
+      if (!verifyResponse.ok) {
+        throw new Error(
+          verification.message || "The code is invalid or expired."
+        );
+      }
 
-const data = JSON.parse(text);
-      if (!response.ok) {
+      const accessToken = verification.accessToken;
+      if (
+        typeof accessToken !== "string" ||
+        verification.tokenType !== "Bearer"
+      ) {
+        throw new Error("The server returned an invalid verification response.");
+      }
+
+      const statusResponse = await fetch(
+        `${API_BASE_URL}/competitions/dance-championship-2026/status`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const data = await readApiResponse(statusResponse);
+      if (!statusResponse.ok) {
         throw new Error(data.message || "Could not retrieve your status.");
       }
 
       setParticipantStatus(data);
+      setStatusOtp("");
+      setStatusOtpSent(false);
     } catch (err) {
       setStatusError(
-        err instanceof Error ? err.message : "Please try again."
+        err instanceof Error
+          ? err.message
+          : "Could not verify the code. Please try again."
       );
     } finally {
       setLoadingStatus(false);
@@ -669,25 +763,88 @@ const data = JSON.parse(text);
             style={styles.input}
             placeholder="Registration email"
             value={statusEmail}
-            onChangeText={setStatusEmail}
+            onChangeText={handleStatusEmailChange}
             keyboardType="email-address"
             autoCapitalize="none"
             autoCorrect={false}
-            editable={!loadingStatus}
+            editable={!loadingStatus && !participantStatus}
           />
 
-          <Pressable
-            style={[
-              styles.registerButton,
-              loadingStatus && styles.disabledButton,
-            ]}
-            onPress={handleCheckStatus}
-            disabled={loadingStatus}
-          >
-            <Text style={styles.buttonText}>
-              {loadingStatus ? "Checking..." : "Check My Status"}
-            </Text>
-          </Pressable>
+          {!statusOtpSent && !participantStatus && (
+            <Pressable
+              style={[
+                styles.registerButton,
+                loadingStatus && styles.disabledButton,
+              ]}
+              onPress={handleSendStatusOtp}
+              disabled={loadingStatus}
+            >
+              <Text style={styles.buttonText}>
+                {loadingStatus ? "Sending code..." : "Send OTP"}
+              </Text>
+            </Pressable>
+          )}
+
+          {statusOtpSent && !participantStatus && (
+            <>
+              <Text style={styles.statusInfo}>
+                {statusMessage}
+              </Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Six-digit verification code"
+                value={statusOtp}
+                onChangeText={(value) =>
+                  setStatusOtp(value.replace(/\D/g, "").slice(0, 6))
+                }
+                keyboardType="number-pad"
+                autoCapitalize="none"
+                autoCorrect={false}
+                maxLength={6}
+                editable={!loadingStatus}
+              />
+              <Pressable
+                style={[
+                  styles.registerButton,
+                  loadingStatus && styles.disabledButton,
+                ]}
+                onPress={handleVerifyStatusOtp}
+                disabled={loadingStatus}
+              >
+                <Text style={styles.buttonText}>
+                  {loadingStatus ? "Verifying..." : "Verify OTP"}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.resendStatusButton,
+                  (loadingStatus || otpCooldown > 0) &&
+                    styles.disabledStatusButton,
+                ]}
+                onPress={handleSendStatusOtp}
+                disabled={loadingStatus || otpCooldown > 0}
+              >
+                <Text style={styles.resendStatusText}>
+                  {otpCooldown > 0
+                    ? `Resend code in ${Math.floor(otpCooldown / 60)
+                        .toString()
+                        .padStart(2, "0")}:${(otpCooldown % 60)
+                        .toString()
+                        .padStart(2, "0")}`
+                    : "Resend code"}
+                </Text>
+              </Pressable>
+            </>
+          )}
+
+          {participantStatus && (
+            <Pressable
+              style={styles.resendStatusButton}
+              onPress={() => handleStatusEmailChange("")}
+            >
+              <Text style={styles.resendStatusText}>Check another email</Text>
+            </Pressable>
+          )}
 
           {statusError ? (
             <Text style={styles.errorText}>{statusError}</Text>
@@ -780,6 +937,26 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginTop: 12,
     lineHeight: 19,
+  },
+  statusInfo: {
+    color: "#6558D3",
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 14,
+  },
+  resendStatusButton: {
+    alignSelf: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginTop: 4,
+  },
+  disabledStatusButton: {
+    opacity: 0.55,
+  },
+  resendStatusText: {
+    color: "#6558D3",
+    fontSize: 14,
+    fontWeight: "700",
   },
   statusDetails: {
     marginTop: 20,
